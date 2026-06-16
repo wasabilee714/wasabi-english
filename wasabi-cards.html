@@ -170,6 +170,52 @@
       font-size: 12px;
     }
 
+    .review-settings {
+      margin-top: 16px;
+      padding: 14px 10px 4px;
+      border-top: 1px solid var(--line);
+    }
+
+    .settings-title {
+      margin: 0 0 10px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .target-row {
+      display: grid;
+      grid-template-columns: 1fr 82px;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .target-row label {
+      color: var(--ink);
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .target-input {
+      width: 100%;
+      min-height: 38px;
+      padding: 6px 8px;
+      border: 1px solid var(--line);
+      border-radius: 0;
+      background: var(--panel);
+      color: var(--ink);
+      font: inherit;
+      text-align: center;
+    }
+
+    .target-hint {
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
     main {
       min-width: 0;
     }
@@ -541,6 +587,8 @@
       aside { display: flex; gap: 6px; overflow-x: auto; padding: 8px; }
       .aside-title { display: none; }
       .filter { flex: 0 0 auto; gap: 10px; border: 0; min-height: 38px; }
+      .review-settings { flex: 0 0 220px; margin-top: 0; padding: 4px 8px; border-top: 0; border-left: 1px solid var(--line); }
+      .settings-title, .target-hint { display: none; }
       .study-card, .empty, .card-shell { min-height: 500px; }
       .study-card.revealed { min-height: 0; }
       .prompt { margin-top: 28px; }
@@ -580,6 +628,14 @@
         <button class="filter" data-filter="pattern">仿写句型 <span class="count" id="patternCount">0</span></button>
         <button class="filter" data-filter="eudic">欧路生词 <span class="count" id="eudicCount">0</span></button>
         <button class="filter" data-filter="weak">薄弱卡片 <span class="count" id="weakCount">0</span></button>
+        <div class="review-settings">
+          <p class="settings-title">每日目标</p>
+          <div class="target-row">
+            <label for="dailyTarget">本轮上限</label>
+            <input class="target-input" id="dailyTarget" type="number" min="5" max="80" step="1" value="20" aria-label="每日复习目标">
+          </div>
+          <p class="target-hint">优先到期和薄弱卡；不足时补入新卡。同组随机。</p>
+        </div>
       </aside>
 
       <main>
@@ -731,10 +787,13 @@
     ];
 
     const STORAGE_KEY = "wasabi-policy-english-v1";
+    const SETTINGS_KEY = "wasabi-review-settings-v1";
+    const DEFAULT_DAILY_TARGET = 20;
     const CLOUD_SESSION_KEY = "wasabi-cloud-session-v1";
     const cloudConfig = window.WASABI_CLOUD || {};
     const today = formatLocalDate();
     let state = loadState();
+    let reviewSettings = loadReviewSettings();
     let filter = "all";
     let queue = [];
     let currentIndex = 0;
@@ -750,6 +809,27 @@
     function formatLocalDate(date = new Date()) {
       const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
       return local.toISOString().slice(0, 10);
+    }
+
+    function loadReviewSettings() {
+      try {
+        const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
+        return {
+          dailyTarget: clampDailyTarget(saved.dailyTarget || DEFAULT_DAILY_TARGET)
+        };
+      } catch {
+        return { dailyTarget: DEFAULT_DAILY_TARGET };
+      }
+    }
+
+    function clampDailyTarget(value) {
+      const number = Number(value);
+      if (!Number.isFinite(number)) return DEFAULT_DAILY_TARGET;
+      return Math.min(80, Math.max(5, Math.round(number)));
+    }
+
+    function saveReviewSettings() {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(reviewSettings));
     }
 
     function loadState() {
@@ -893,7 +973,8 @@
         cards,
         lastStudyDate: state.lastStudyDate,
         streak: state.streak,
-        lastModifiedAt: state.lastModifiedAt
+        lastModifiedAt: state.lastModifiedAt,
+        reviewSettings
       };
     }
 
@@ -918,6 +999,10 @@
       }
       state.streak = Math.max(state.streak || 1, remote.streak || 1);
       state.lastModifiedAt = [state.lastModifiedAt, remote.lastModifiedAt].filter(Boolean).sort().at(-1) || null;
+      if (remote.reviewSettings?.dailyTarget) {
+        reviewSettings.dailyTarget = clampDailyTarget(remote.reviewSettings.dailyTarget);
+        saveReviewSettings();
+      }
     }
 
     function mergeCloudCardCatalog(cards = []) {
@@ -1020,10 +1105,60 @@
       return card.type === filter;
     }
 
+    function dateDiffInDays(a, b) {
+      const start = new Date(`${a}T00:00:00`);
+      const end = new Date(`${b}T00:00:00`);
+      return Math.round((end - start) / 86400000);
+    }
+
+    function isWeak(card) {
+      return card.lapses > 0 || card.lastRating === "again";
+    }
+
+    function isDue(card) {
+      return card.due <= today;
+    }
+
+    function reviewPriority(card) {
+      const overdueDays = isDue(card) ? Math.max(0, dateDiffInDays(card.due, today)) : 0;
+      let score = 0;
+      if (isWeak(card)) score += 1000;
+      if (isDue(card)) score += 600 + overdueDays * 35;
+      if (!card.interval) score += 160;
+      if (card.type === "phrase" || card.type === "eudic") score += 15;
+      return score;
+    }
+
+    function shuffle(cards) {
+      const copy = [...cards];
+      for (let index = copy.length - 1; index > 0; index -= 1) {
+        const swapIndex = Math.floor(Math.random() * (index + 1));
+        [copy[index], copy[swapIndex]] = [copy[swapIndex], copy[index]];
+      }
+      return copy;
+    }
+
+    function randomisedPriorityQueue(cards) {
+      return shuffle(cards)
+        .map(card => ({
+          card,
+          rank: reviewPriority(card) + Math.random() * 120
+        }))
+        .sort((a, b) => b.rank - a.rank)
+        .map(item => item.card);
+    }
+
     function buildQueue() {
       const cards = Object.values(state.cards).filter(matchesFilter);
       const due = cards.filter(card => card.due <= today);
-      queue = due.length ? due : cards;
+      const target = reviewSettings.dailyTarget;
+      const selected = due.length
+        ? [
+            ...randomisedPriorityQueue(due),
+            ...randomisedPriorityQueue(cards.filter(card => !isDue(card)))
+          ]
+        : randomisedPriorityQueue(cards);
+      queue = selected.slice(0, target);
       currentIndex = 0;
       revealed = false;
       submittedAnswer = "";
@@ -1039,7 +1174,7 @@
           <section class="empty">
             <div>
               <h2>本轮完成</h2>
-              <p>今天的卡片已经过了一遍。真正记住，靠的是明天再回来。</p>
+              <p>本轮目标已经完成。真正记住，靠的是按节奏回来。</p>
             </div>
           </section>`;
         document.getElementById("sessionLabel").textContent = "复习完成";
@@ -1097,7 +1232,8 @@
           </div>
         </article>`;
 
-      document.getElementById("sessionLabel").textContent = filter === "all" ? "今日复习" : document.querySelector(`.filter[data-filter="${filter}"]`).childNodes[0].textContent.trim();
+      const filterLabel = filter === "all" ? "今日复习" : document.querySelector(`.filter[data-filter="${filter}"]`).childNodes[0].textContent.trim();
+      document.getElementById("sessionLabel").textContent = `${filterLabel} · 目标 ${queue.length} 张`;
       document.getElementById("positionLabel").textContent = `${currentIndex + 1} / ${queue.length}`;
       document.getElementById("progressFill").style.width = `${(currentIndex / queue.length) * 100}%`;
 
@@ -1169,6 +1305,10 @@
       document.getElementById("patternCount").textContent = cards.filter(card => card.type === "pattern").length;
       document.getElementById("eudicCount").textContent = cards.filter(card => card.type === "eudic").length;
       document.getElementById("weakCount").textContent = cards.filter(card => card.lapses > 0 || card.lastRating === "again").length;
+      const dailyTarget = document.getElementById("dailyTarget");
+      if (dailyTarget && Number(dailyTarget.value) !== reviewSettings.dailyTarget) {
+        dailyTarget.value = reviewSettings.dailyTarget;
+      }
     }
 
     function setSyncState(message, kind = "") {
@@ -1217,6 +1357,14 @@
         filter = button.dataset.filter;
         buildQueue();
       });
+    });
+
+    document.getElementById("dailyTarget").addEventListener("change", event => {
+      reviewSettings.dailyTarget = clampDailyTarget(event.target.value);
+      event.target.value = reviewSettings.dailyTarget;
+      saveReviewSettings();
+      saveState();
+      buildQueue();
     });
 
     const helpDialog = document.getElementById("helpDialog");
